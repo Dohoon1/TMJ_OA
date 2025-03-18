@@ -74,16 +74,15 @@ class LogisticRegressionModel(nn.Module):
         x = self.sigmoid(x)
         return x
 
-# 모델, 손실 함수, 최적화 도구 설정
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')  # CUDA 1번 사용
-model_logistic = LogisticRegressionModel(input_size=X_train_tensor.shape[1]).to(device)  # 변수명 수정
-criterion = nn.BCELoss()  # 이진 분류용 손실 함수
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu') 
+model_logistic = LogisticRegressionModel(input_size=X_train_tensor.shape[1]).to(device)
+criterion = nn.BCELoss()  
 optimizer = optim.Adam(model_logistic.parameters(), lr=0.005)
 
-# 학습 함수
+# Training
 def train_model(model, train_loader, criterion, optimizer, num_epochs=100):
-    model.train()  # 학습 모드 설정
-    epoch_losses = []  # 에포크별 손실 저장 리스트
+    model.train()  
+    epoch_losses = []  
     for epoch in range(num_epochs):
         running_loss = 0.0
         for inputs, labels in train_loader:
@@ -99,26 +98,26 @@ def train_model(model, train_loader, criterion, optimizer, num_epochs=100):
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}')
     return epoch_losses
 
-# 테스트 함수
+# Test
 def test_model(model, test_loader):
-    model.eval()  # 평가 모드로 설정
+    model.eval() 
     all_preds = []
     all_labels = []
     with torch.no_grad():
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device, dtype=torch.float32)
             outputs = model(inputs).squeeze()
-            predicted = (outputs > 0.5).float()  # 0.5 이상이면 1, 그렇지 않으면 0으로 예측
+            predicted = (outputs > 0.5).float() 
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
     test_accuracy = accuracy_score(all_labels, all_preds)
     print(f'Test Accuracy: {test_accuracy:.4f}')
 
-# 모델 학습
+# Model Training 
 losses = train_model(model_logistic, train_loader, criterion, optimizer, num_epochs=1000)
 
-# 학습곡선 시각화
+# Learning curve
 plt.figure(figsize=(8,6))
 plt.plot(range(1, len(losses) + 1), losses)
 plt.xlabel('Epoch')
@@ -127,37 +126,32 @@ plt.title('Training Loss Curve')
 plt.grid(True)
 plt.show()
 
-# 테스트 성능 평가
+# Test
 test_model(model_logistic, test_loader)
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-# 모델 학습 후, 기울기(계수)를 추출합니다.
-# model_logistic는 이미 학습된 LogisticRegressionModel 인스턴스입니다.
+# Extract Coefficients and odds ratios
 with torch.no_grad():
-    # fc 레이어의 weight는 (1, input_size) 형태입니다.
     coefficients = model_logistic.fc.weight.data.cpu().numpy()[0]  # shape: (input_size,)
-    # odds ratio는 각 계수의 지수 변환으로 계산합니다.
     odds_ratio = np.exp(coefficients)
 
-# 두 개의 수평 바 차트를 하나의 figure에 그립니다.
 fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(14, 6))
 
-# 1. 계수(Coefficient) 바 차트
+# 1. Coefficient
 bars0 = axes[0].barh(features, coefficients, color='skyblue')
 axes[0].set_title('Feature Coefficients')
 axes[0].set_xlabel('Coefficient Value')
 axes[0].set_ylabel('Feature')
 
-# 2. Odds Ratio 바 차트
+# 2. Odds Ratio
 bars1 = axes[1].barh(features, odds_ratio, color='salmon')
 axes[1].set_title('Feature Odds Ratios')
 axes[1].set_xlabel('Odds Ratio')
 axes[1].set_ylabel('Feature')
 
-# 각 막대 옆에 해당 수치값을 텍스트로 추가 (legend 대신 직접 annotation)
 for bar in bars0:
     width = bar.get_width()
     # 막대 중앙 위치에 수치값을 표시합니다.
@@ -184,45 +178,41 @@ from sklearn.metrics import (
 )
 from sklearn.utils import resample
 
-#y_test는 실제 레이블, predicted_probs는 모델에서 얻은 양성 클래스 예측 확률, predicted는 0,1 예측값
-
 predicted_probs = model_logistic(X_test_tensor.to(device)).detach().cpu().numpy().squeeze()
 predicted = (predicted_probs > 0.5).astype(int)
 
-# confusion matrix 계산
+# confusion matrix
 cm = confusion_matrix(y_test, predicted)
 TN, FP, FN, TP = cm.ravel()
 
-# Sensitivity (Recall), Specificity, F1 score, Accuracy 계산
+# Sensitivity (Recall), Specificity, F1 score, Accuracy
 sensitivity = TP / (TP + FN) if (TP+FN) != 0 else 0
 specificity = TN / (TN + FP) if (TN+FP) != 0 else 0
 f1 = f1_score(y_test, predicted)
 accuracy = accuracy_score(y_test, predicted)
 auroc = roc_auc_score(y_test, predicted_probs)
 
-# ROC 곡선 계산
+# ROC curve
 fpr, tpr, thresholds = roc_curve(y_test, predicted_probs)
 roc_auc = auc(fpr, tpr)
 
-# 부트스트래핑을 통한 AUROC의 95% 신뢰구간 계산 (예: 1000번 반복)
+# AUROC 95% CI using bootstraping
 n_bootstraps = 1000
 rng = np.random.RandomState(42)
 bootstrapped_scores = []
 for i in range(n_bootstraps):
-    # 인덱스 샘플링 (with replacement)
     indices = rng.randint(0, len(y_test), len(y_test))
     if len(np.unique(y_test[indices])) < 2:
-        continue  # 한쪽 클래스만 있으면 스킵
+        continue  
     score = roc_auc_score(y_test[indices], predicted_probs[indices])
     bootstrapped_scores.append(score)
 
 bootstrapped_scores = np.array(bootstrapped_scores)
 bootstrapped_scores.sort()
-# 95% 신뢰구간: 하위 2.5%와 상위 97.5% percentiles
+
 ci_lower = bootstrapped_scores[int(0.025 * len(bootstrapped_scores))]
 ci_upper = bootstrapped_scores[int(0.975 * len(bootstrapped_scores))]
 
-# 결과 출력
 print("Sensitivity (Recall): {:.4f}".format(sensitivity))
 print("Specificity: {:.4f}".format(specificity))
 print("F1 Score: {:.4f}".format(f1))
@@ -230,7 +220,7 @@ print("Accuracy: {:.4f}".format(accuracy))
 print("AUROC: {:.4f}".format(auroc))
 print("95% CI for AUROC: [{:.4f}, {:.4f}]".format(ci_lower, ci_upper))
 
-# ROC 곡선 그리기
+# ROC curve
 plt.figure(figsize=(8, 6))
 plt.plot(fpr, tpr, color='blue', label=f'ROC curve (AUC = {roc_auc:.2f})')
 plt.plot([0, 1], [0, 1], color='grey', linestyle='--')
@@ -239,5 +229,3 @@ plt.ylabel('True Positive Rate')
 plt.title('ROC Curve for logistic regression')
 plt.legend(loc="lower right")
 plt.show()
-
-
