@@ -1,0 +1,465 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+from collections import Counter
+
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    confusion_matrix, f1_score, accuracy_score,
+    roc_curve, roc_auc_score, auc
+)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+# =============================================================================
+def set_seed(seed=42):
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(40)
+
+# =============================================================================
+# Logistic regression model
+class LogisticRegressionModel(nn.Module):
+    def __init__(self, input_size):
+        super(LogisticRegressionModel, self).__init__()
+        self.fc = nn.Linear(input_size, 1)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        x = self.fc(x)
+        return self.sigmoid(x)
+
+# Training Function
+def train_logistic_model(model, train_loader, criterion, optimizer, num_epochs=500):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs).squeeze()
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        if (epoch+1) % 100 == 0:
+            print(f"[Custom LR] Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader):.4f}")
+
+# =============================================================================
+xlsx_path = "/content/TMJ_OA_MRI_data.xlsx" 
+df = pd.read_excel(xlsx_path).dropna()
+df.rename(columns={'PA_TMJ_OA': 'PR_TMJ_OA'}, inplace=True)
+df = df.drop(columns=['ID'])
+
+# Age group
+bins = [9, 13, 16, 19]
+labels = ['1', '2', '3']
+df['AgeGroup'] = pd.cut(df['Age'], bins=bins, labels=labels, right=True)
+
+# Age group one-hot encoding
+df = pd.get_dummies(df, columns=['AgeGroup'], prefix='AgeGroup')
+for col in df.columns:
+    if col.startswith('AgeGroup_'):
+        df[col] = df[col].astype(int)
+
+#'Age', 'Pain side' delete
+df = df.drop(columns=['Age', 'Pain side'])
+
+features = ['Sex', 'VAS', 'Symptom duration', 'TMJ noise', 'Muscle stiffness',
+            'Locking', 'Bruxism', 'MRI_TMJ_ADD', 'PR_TMJ_OA',
+            'NaMx_Discrepancy', 'MxMn_Discrepancy']
+target = 'MRI_TMJ_OA'
+
+age_group_cols = ['AgeGroup_1', 'AgeGroup_2', 'AgeGroup_3']
+
+# =============================================================================
+metrics_dt = []         
+metrics_lr = []         
+roc_dt = {} 
+roc_lr = {}             
+ft_importance_dt = {}   
+ft_coef_lr = {}         
+
+# AUROC CI
+n_bootstraps = 1000
+rng = np.random.RandomState(40)
+df
+
+# AgeGroup_1, AgeGroup_2, AgeGroup_3 analysis
+
+for group in age_group_cols:
+    print(f"Processing {group} ...")
+    df_group = df[df[group] == 1].copy()
+    df_group.drop(columns=age_group_cols, inplace=True)
+
+    X_group = df_group.drop(columns=[target]).values
+    y_group = df_group[target].values
+    print(X_group.shape[0])
+
+    # train-test split (stratify)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_group, y_group, test_size=0.2, random_state=42, stratify=y_group)
+
+    # --------------------- Deision Tree ---------------------
+    counter = Counter(y_train)
+    n_minority = min(counter.values())
+    k_neighbors = 5 if n_minority > 5 else max(1, n_minority - 1)
+    smote_dt = SMOTE(random_state=42, k_neighbors=k_neighbors)
+    X_train_dt, y_train_dt = smote_dt.fit_resample(X_train, y_train)
+
+    clf_dt = DecisionTreeClassifier(max_depth=3, random_state=42)
+    clf_dt.fit(X_train_dt, y_train_dt)
+
+    y_pred_proba_dt = clf_dt.predict_proba(X_test)[:, 1]
+    y_pred_dt = (y_pred_proba_dt > 0.5).astype(int)
+
+    cm = confusion_matrix(y_test, y_pred_dt)
+    TN, FP, FN, TP = cm.ravel()
+    sens = TP/(TP+FN) if (TP+FN)>0 else 0
+    spec = TN/(TN+FP) if (TN+FP)>0 else 0
+    f1_val = f1_score(y_test, y_pred_dt)
+    acc_val = accuracy_score(y_test, y_pred_dt)
+    auroc_val = roc_auc_score(y_test, y_pred_proba_dt)
+
+    boot_scores = []
+    for i in range(n_bootstraps):
+        indices = rng.randint(0, len(y_test), len(y_test))
+        if len(np.unique(y_test[indices]))<2:
+            continue
+        score = roc_auc_score(y_test[indices], y_pred_proba_dt[indices])
+        boot_scores.append(score)
+    boot_scores = np.array(boot_scores)
+    boot_scores.sort()
+    ci_lower = boot_scores[int(0.025*len(boot_scores))] if len(boot_scores)>0 else 0
+    ci_upper = boot_scores[int(0.975*len(boot_scores))] if len(boot_scores)>0 else 0
+
+    metrics_dt.append({
+        "Age Group": group,
+        "Sensitivity": sens,
+        "Specificity": spec,
+        "F1 Score": f1_val,
+        "Accuracy": acc_val,
+        "AUROC": auroc_val,
+        "AUROC 95% CI": f"[{ci_lower:.2f}, {ci_upper:.2f}]"
+    })
+
+    fpr_dt, tpr_dt, _ = roc_curve(y_test, y_pred_proba_dt)
+    auc_dt_val = auc(fpr_dt, tpr_dt)
+    roc_dt[group] = (fpr_dt, tpr_dt, auc_dt_val)
+
+    ft_importance_dt[group] = clf_dt.feature_importances_
+
+    # --------------------- Logistic regression ---------------------
+    scaler_lr = StandardScaler()
+    X_train_scaled = scaler_lr.fit_transform(X_train)
+    X_test_scaled = scaler_lr.transform(X_test)
+
+    counter_lr = Counter(y_train)
+    n_minority_lr = min(counter_lr.values())
+    k_neighbors_lr = 5 if n_minority_lr>5 else max(1, n_minority_lr-1)
+    smote_lr = SMOTE(random_state=42, k_neighbors=k_neighbors_lr)
+    X_train_lr, y_train_lr = smote_lr.fit_resample(X_train_scaled, y_train)
+
+    # Convert to tensors
+    X_train_tensor = torch.tensor(X_train_lr, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train_lr, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+    # y_test_tensor not needed for predictions since we compare with numpy arrays
+
+    # Create DataLoader
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+
+    input_size = X_train_lr.shape[1]
+    model_lr_custom = LogisticRegressionModel(input_size=input_size)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model_lr_custom.parameters(), lr=0.001)
+
+    # Train custom logistic regression model
+    train_logistic_model(model_lr_custom, train_loader, criterion, optimizer, num_epochs=2000)
+
+    # Evaluate on test set
+    model_lr_custom.eval()
+    with torch.no_grad():
+        outputs = model_lr_custom(X_test_tensor).squeeze()
+        y_pred_proba_custom = outputs.numpy()
+    y_pred_custom = (y_pred_proba_custom > 0.5).astype(int)
+
+    cm_lr = confusion_matrix(y_test, y_pred_custom)
+    TN_lr, FP_lr, FN_lr, TP_lr = cm_lr.ravel()
+    sens_lr = TP_lr/(TP_lr+FN_lr) if (TP_lr+FN_lr)>0 else 0
+    spec_lr = TN_lr/(TN_lr+FP_lr) if (TN_lr+FP_lr)>0 else 0
+    f1_lr_val = f1_score(y_test, y_pred_custom)
+    acc_lr_val = accuracy_score(y_test, y_pred_custom)
+    auroc_lr_val = roc_auc_score(y_test, y_pred_proba_custom)
+
+    boot_scores_lr = []
+    for i in range(n_bootstraps):
+        indices = rng.randint(0, len(y_test), len(y_test))
+        if len(np.unique(y_test[indices]))<2:
+            continue
+        score = roc_auc_score(y_test[indices], y_pred_proba_custom[indices])
+        boot_scores_lr.append(score)
+    boot_scores_lr = np.array(boot_scores_lr)
+    boot_scores_lr.sort()
+    ci_lower_lr = boot_scores_lr[int(0.025*len(boot_scores_lr))] if len(boot_scores_lr)>0 else 0
+    ci_upper_lr = boot_scores_lr[int(0.975*len(boot_scores_lr))] if len(boot_scores_lr)>0 else 0
+
+    metrics_lr.append({
+        "Age Group": group,
+        "Sensitivity": sens_lr,
+        "Specificity": spec_lr,
+        "F1 Score": f1_lr_val,
+        "Accuracy": acc_lr_val,
+        "AUROC": auroc_lr_val,
+        "AUROC 95% CI": f"[{ci_lower_lr:.2f}, {ci_upper_lr:.2f}]"
+    })
+
+    fpr_lr, tpr_lr, _ = roc_curve(y_test, y_pred_proba_custom)
+    auc_lr_val = auc(fpr_lr, tpr_lr)
+    roc_lr[group] = (fpr_lr, tpr_lr, auc_lr_val)
+
+    # Feature Coefficients & Odds Ratio from custom LR
+    # Extract weight from the linear layer; shape = (1, input_size)
+    coef_vals = model_lr_custom.fc.weight.data.numpy()[0]
+    odds_vals = np.exp(coef_vals)
+    ft_coef_lr[group] = {"coefficients": coef_vals, "odds_ratio": odds_vals}
+
+    # --------------------- ROC curve ---------------------
+    plt.figure(figsize=(8,6))
+    plt.plot(fpr_dt, tpr_dt, color='blue', label=f'DT {group} (AUC={auc_dt_val:.2f})')
+    plt.plot([0,1],[0,1],'k--', label='Random')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve - Decision Tree {group}")
+    plt.legend(loc='lower right')
+    plt.show()
+
+    plt.figure(figsize=(8,6))
+    plt.plot(fpr_lr, tpr_lr, color='red', label=f'Custom LR {group} (AUC={auc_lr_val:.2f})')
+    plt.plot([0,1],[0,1],'k--', label='Random')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve - Custom Logistic Regression {group}")
+    plt.legend(loc='lower right')
+    plt.show()
+
+# # =============================================================================
+# # All feature used including continuous age
+# # =============================================================================
+df_all = pd.read_excel(xlsx_path).dropna()
+df_all.rename(columns={'PA_TMJ_OA': 'PR_TMJ_OA'}, inplace=True)
+df_all = df_all.drop(columns=['ID', 'Pain side'])  
+
+features_all = [ 'Sex','Age', 'VAS', 'Symptom duration', 'TMJ noise', 'Muscle stiffness',
+                'Locking', 'Bruxism', 'MRI_TMJ_ADD', 'PR_TMJ_OA',
+                'NaMx_Discrepancy', 'MxMn_Discrepancy']
+target_all = 'MRI_TMJ_OA'
+
+X_all = df_all[features_all].values
+y_all = df_all[target_all].values
+
+X_train_all, X_test_all, y_train_all, y_test_all = train_test_split(
+    X_all, y_all, test_size=0.2, random_state=42, stratify=y_all)
+
+# ---- 전체 데이터: 결정 트리
+counter_all_dt = Counter(y_train_all)
+n_minority_all_dt = min(counter_all_dt.values())
+k_neighbors_all_dt = 5 if n_minority_all_dt>5 else max(1, n_minority_all_dt-1)
+smote_all_dt = SMOTE(random_state=42, k_neighbors=k_neighbors_all_dt)
+X_train_dt_all, y_train_dt_all = smote_all_dt.fit_resample(X_train_all, y_train_all)
+
+clf_dt_all = DecisionTreeClassifier(max_depth=3, random_state=42)
+clf_dt_all.fit(X_train_dt_all, y_train_dt_all)
+
+y_pred_proba_dt_all = clf_dt_all.predict_proba(X_test_all)[:,1]
+y_pred_dt_all = (y_pred_proba_dt_all > 0.5).astype(int)
+
+cm_all_dt = confusion_matrix(y_test_all, y_pred_dt_all)
+TN_all, FP_all, FN_all, TP_all = cm_all_dt.ravel()
+sens_all = TP_all/(TP_all+FN_all) if (TP_all+FN_all)>0 else 0
+spec_all = TN_all/(TN_all+FP_all) if (TN_all+FP_all)>0 else 0
+f1_all = f1_score(y_test_all, y_pred_dt_all)
+acc_all = accuracy_score(y_test_all, y_pred_dt_all)
+auroc_all = roc_auc_score(y_test_all, y_pred_proba_dt_all)
+
+boot_scores_all = []
+for i in range(n_bootstraps):
+    indices = rng.randint(0, len(y_test_all), len(y_test_all))
+    if len(np.unique(y_test_all[indices]))<2:
+        continue
+    score = roc_auc_score(y_test_all[indices], y_pred_proba_dt_all[indices])
+    boot_scores_all.append(score)
+boot_scores_all.sort()
+ci_low_all = boot_scores_all[int(0.025*len(boot_scores_all))] if len(boot_scores_all)>0 else 0
+ci_up_all = boot_scores_all[int(0.975*len(boot_scores_all))] if len(boot_scores_all)>0 else 0
+
+metrics_dt.append({
+    "Age Group": "AllDataContinuousAge",
+    "Sensitivity": sens_all,
+    "Specificity": spec_all,
+    "F1 Score": f1_all,
+    "Accuracy": acc_all,
+    "AUROC": auroc_all,
+    "AUROC 95% CI": f"[{ci_low_all:.2f}, {ci_up_all:.2f}]"
+})
+
+fpr_dt_all, tpr_dt_all, _ = roc_curve(y_test_all, y_pred_proba_dt_all)
+auc_dt_all = auc(fpr_dt_all, tpr_dt_all)
+roc_dt["AllDataContinuousAge"] = (fpr_dt_all, tpr_dt_all, auc_dt_all)
+ft_importance_dt["AllDataContinuousAge"] = clf_dt_all.feature_importances_
+
+scaler_all = StandardScaler()
+X_train_all_scaled = scaler_all.fit_transform(X_train_all)
+X_test_all_scaled = scaler_all.transform(X_test_all)
+
+counter_all_lr = Counter(y_train_all)
+n_minority_all_lr = min(counter_all_lr.values())
+k_neighbors_all_lr = 5 if n_minority_all_lr>5 else max(1, n_minority_all_lr-1)
+smote_all_lr = SMOTE(random_state=42, k_neighbors=k_neighbors_all_lr)
+X_train_lr_all, y_train_lr_all = smote_all_lr.fit_resample(X_train_all_scaled, y_train_all)
+
+# Convert to tensors
+X_train_all_tensor = torch.tensor(X_train_lr_all, dtype=torch.float32)
+y_train_all_tensor = torch.tensor(y_train_lr_all, dtype=torch.float32)
+X_test_all_tensor = torch.tensor(X_test_all_scaled, dtype=torch.float32)
+
+train_dataset_all = TensorDataset(X_train_all_tensor, y_train_all_tensor)
+train_loader_all = DataLoader(train_dataset_all, batch_size=128, shuffle=True)
+
+input_size_all = X_train_all_tensor.shape[1]
+model_lr_all_custom = LogisticRegressionModel(input_size=input_size_all)
+criterion_all = nn.BCELoss()
+optimizer_all = optim.Adam(model_lr_all_custom.parameters(), lr=0.001)
+
+train_logistic_model(model_lr_all_custom, train_loader_all, criterion_all, optimizer_all, num_epochs=2000)
+
+model_lr_all_custom.eval()
+with torch.no_grad():
+    outputs_all = model_lr_all_custom(X_test_all_tensor).squeeze()
+    y_pred_proba_lr_all = outputs_all.numpy()
+y_pred_lr_all = (y_pred_proba_lr_all > 0.5).astype(int)
+
+cm_all_lr = confusion_matrix(y_test_all, y_pred_lr_all)
+TN_all_lr, FP_all_lr, FN_all_lr, TP_all_lr = cm_all_lr.ravel()
+sens_all_lr = TP_all_lr/(TP_all_lr+FN_all_lr) if (TP_all_lr+FN_all_lr)>0 else 0
+spec_all_lr = TN_all_lr/(TN_all_lr+FP_all_lr) if (TN_all_lr+FP_all_lr)>0 else 0
+f1_all_lr = f1_score(y_test_all, y_pred_lr_all)
+acc_all_lr = accuracy_score(y_test_all, y_pred_lr_all)
+auroc_all_lr = roc_auc_score(y_test_all, y_pred_proba_lr_all)
+
+boot_scores_all_lr = []
+for i in range(n_bootstraps):
+    indices = rng.randint(0, len(y_test_all), len(y_test_all))
+    if len(np.unique(y_test_all[indices]))<2:
+        continue
+    score = roc_auc_score(y_test_all[indices], y_pred_proba_lr_all[indices])
+    boot_scores_all_lr.append(score)
+boot_scores_all_lr.sort()
+ci_low_all_lr = boot_scores_all_lr[int(0.025*len(boot_scores_all_lr))] if len(boot_scores_all_lr)>0 else 0
+ci_up_all_lr = boot_scores_all_lr[int(0.975*len(boot_scores_all_lr))] if len(boot_scores_all_lr)>0 else 0
+
+metrics_lr.append({
+    "Age Group": "AllDataContinuousAge",
+    "Sensitivity": sens_all_lr,
+    "Specificity": spec_all_lr,
+    "F1 Score": f1_all_lr,
+    "Accuracy": acc_all_lr,
+    "AUROC": auroc_all_lr,
+    "AUROC 95% CI": f"[{ci_low_all_lr:.2f}, {ci_up_all_lr:.2f}]"
+})
+
+fpr_lr_all, tpr_lr_all, _ = roc_curve(y_test_all, y_pred_proba_lr_all)
+auc_lr_all = auc(fpr_lr_all, tpr_lr_all)
+roc_lr["AllDataContinuousAge"] = (fpr_lr_all, tpr_lr_all, auc_lr_all)
+coef_all_lr = model_lr_all_custom.fc.weight.data.numpy()[0]
+odds_all_lr = np.exp(coef_all_lr)
+ft_coef_lr["AllDataContinuousAge"] = {"coefficients": coef_all_lr, "odds_ratio": odds_all_lr}
+
+# =============================================================================
+# Combined ROC Plots
+# =============================================================================
+# Decision tree Combined ROC
+plt.figure(figsize=(8,6))
+plt.plot([0,1],[0,1],'k--', label='Random Chance')
+for group, (fpr, tpr, auc_val) in roc_dt.items():
+    plt.plot(fpr, tpr, label=f'{group} (AUC={auc_val:.2f})')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("Combined ROC Curves - Decision Tree")
+plt.legend(loc='lower right')
+plt.show()
+
+# Logistic Regression Combined ROC
+plt.figure(figsize=(8,6))
+plt.plot([0,1],[0,1],'k--', label='Random Chance')
+for group, (fpr, tpr, auc_val) in roc_lr.items():
+    plt.plot(fpr, tpr, label=f'{group} (AUC={auc_val:.2f})')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("Combined ROC Curves - Custom Logistic Regression")
+plt.legend(loc='lower right')
+plt.show()
+
+# =============================================================================
+# Metrics Tables
+# =============================================================================
+df_metrics_dt = pd.DataFrame(metrics_dt)
+df_metrics_lr = pd.DataFrame(metrics_lr)
+
+print("=== Decision Tree Metrics (AgeGroup + AllDataContinuousAge) ===")
+print(df_metrics_dt.to_string(index=False))
+print("\n=== Custom Logistic Regression Metrics (AgeGroup + AllDataContinuousAge) ===")
+print(df_metrics_lr.to_string(index=False))
+
+# =============================================================================
+# Feature Importance / Coefficients Plots & Tables
+# =============================================================================
+# Decision tree Feature Importances
+print("\n=== Decision Tree Feature Importances ===")
+for group, importances in ft_importance_dt.items():
+    if group == "AllDataContinuousAge":
+        used_features = features_all 
+    else:
+        used_features = features
+    print(f"[{group}]")
+    for feat, imp in zip(used_features, importances):
+        print(f"  {feat}: {imp:.4f}")
+    print()
+
+# Logistic Regression Coefficients & Odds Ratios
+print("\n=== Custom Logistic Regression Feature Coefficients & Odds Ratios ===")
+for group, coef_info in ft_coef_lr.items():
+    if group == "AllDataContinuousAge":
+        used_features = features_all
+    else:
+        used_features = features
+    print(f"[{group}]")
+    for feat, cval, oval in zip(used_features, coef_info["coefficients"], coef_info["odds_ratio"]):
+        print(f"  {feat}: Coef={cval:.4f}, OR={oval:.4f}")
+    print()
+
+# Decision tree Feature Importance Bar Charts 
+for group, importances in ft_importance_dt.items():
+    if group == "AllDataContinuousAge":
+        used_features = features_all
+    else:
+        used_features = features
+    plt.figure(figsize=(10,6))
+    bars = plt.barh(used_features, importances, color='skyblue')
+    plt.xlabel("Importance")
+    plt.title(f"Decision Tree Feature Importances for {group}")
+    for bar in bars:
+        width = bar.get_width()
+        plt.text(width, bar.get_y() + bar.get_height()/2, f"{width:.2f}", va='center', ha='left', fontsize=10, color='black')
+    plt.tight_layout()
+    plt.show()
