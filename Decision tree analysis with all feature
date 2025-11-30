@@ -2,156 +2,342 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
-from scipy.cluster.hierarchy import linkage, dendrogram
-import networkx as nx
-import plotly.graph_objects as go
+import random
+import torch # set_seed를 위해 필요
 
-from sklearn.decomposition import PCA
-from mpl_toolkits.mplot3d import Axes3D
-from sklearn.manifold import MDS
-from scipy.spatial.distance import pdist, squareform
-import plotly.io as pio
-
+from sklearn.model_selection import StratifiedKFold
 from sklearn.tree import DecisionTreeClassifier, plot_tree
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import confusion_matrix, f1_score, accuracy_score, roc_auc_score
 from imblearn.over_sampling import SMOTE
-from sklearn.tree import plot_tree
 
-xlsx_path = '/content/TMJ_OA_MRI_data.xlsx' 
+# --- 0. 시드 고정 ---
 
-df = pd.read_excel(xlsx_path).dropna()
-df.rename(columns={'PA_TMJ_OA': 'PR_TMJ_OA'}, inplace=True)
-df = df.drop(columns=['ID', 'Pain side'])
-
-# Seed
 def set_seed(seed=42):
+
     torch.manual_seed(seed)
+
     torch.cuda.manual_seed(seed)
+
     torch.cuda.manual_seed_all(seed)  # if using multi-GPU
+
     np.random.seed(seed)
+
     random.seed(seed)
+
     torch.backends.cudnn.deterministic = True  # for reproducibility
+
     torch.backends.cudnn.benchmark = False
+
+
 
 set_seed(42)
 
-features = [ 'Sex', 'Age',	'VAS', 'Symptom duration', 'TMJ noise',	'Muscle stiffness',	'Locking',	'Bruxism', 'MRI_TMJ_ADD',	'PR_TMJ_OA', 'NaMx_Discrepancy', 'MxMn_Discrepancy']
-target = ['MRI_TMJ_OA']
 
-# 독립변수와 종속변수 설정 / pain side도 feature로 사용하고 싶다면 아래에서 'Pain side' 제거하고 위의 feature 리스트에 'Pain side' 추가
-X = df.drop(columns=['MRI_TMJ_OA']).values
-y = df['MRI_TMJ_OA'].values
 
-# Data splitting
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+# --- 1. 데이터 로딩 ---
 
-# SMOTE 
-smote = SMOTE(random_state=42)
-X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+xlsx_path = '/content/TMJ_OA_MRI_data (1).xlsx'
 
-# Decision Tree with (max_depth=3)
-clf = DecisionTreeClassifier(max_depth=3, random_state=42)
-clf.fit(X_train_res, y_train_res)
+df = pd.read_excel(xlsx_path).dropna()
 
-# Evaluation with test data
-y_pred = clf.predict(X_test)
-print("Test Accuracy:", clf.score(X_test, y_test))
+df.rename(columns={'PA_TMJ_OA': 'PR_TMJ_OA'}, inplace=True)
 
-plt.figure(figsize=(12, 8))
-plot_tree(
-    clf,
-    feature_names=features,         
-    class_names=['No_OA', 'OA'],    
-    filled=True,                    
-    rounded=True,                   
-    impurity=True,                
-    proportion=False,               
-    fontsize=10,                    
-    precision=3,                  
-    label='all'                     
-)
-plt.title("Decision Tree (depth=3)")
-plt.show()
+df = df.drop(columns=['ID', 'Pain side'])
 
-# Feature Importance of tree model
-importances = clf.feature_importances_
-importance_df = pd.DataFrame({'Feature': features, 'Importance': importances})
-importance_df = importance_df.sort_values(by='Importance', ascending=True)
 
-plt.figure(figsize=(12,6))
-bars = plt.barh(importance_df['Feature'], importance_df['Importance'], color='skyblue')
-plt.title("Feature Importance (Decision Tree)")
-plt.xlabel("Importance")
-plt.ylabel("Features")
 
-# bar plot 
-for bar in bars:
-    width = bar.get_width()
-    plt.text(width, bar.get_y() + bar.get_height()/2, f'{width:.2f}',
-             va='center', ha='left', fontsize=10, color='black')
+target = 'MRI_TMJ_OA'
 
-plt.tight_layout()
-plt.show()
+y = df[target].values
+
+
+
+# --- 2. 모델별 변수 리스트 정의 ---
+
+features_model1 = [
+
+    'Sex', 'Age', 'VAS', 'Symptom duration', 'TMJ noise', 
+
+    'Muscle stiffness', 'Locking', 'Bruxism'
+
+] # Clinical only (8개)
+
+
+
+features_model2 = [
+
+    'MRI_TMJ_ADD', 'PR_TMJ_OA', 'NaMx_Discrepancy', 'MxMn_Discrepancy'
+
+] # Imaging only (4개)
+
+
+single_features_model = [
+
+    'PR_TMJ_OA'
+
+] 
+
+features_model3 = features_model1 + features_model2 # Combined (12개)
+
+
+
+# 실행할 모델 딕셔너리
+
+model_feature_sets = {
+
+    "Model 1 (Clinical Variables only)": features_model1,
+
+    "Model 2 (Imaging Variables only)": features_model2,
+
+    "Model 3 (Combined Variables)": features_model3
+    
+    #"Single Model (PR_TMJ_OA)": single_features_model
+}
+
+def calculate_ci(y_true, y_prob, n_bootstraps=1000, alpha=0.95):
+    stats = []
+    if len(y_true) < 5: return 0.0, 0.0 # 예외 처리
+    
+    for i in range(n_bootstraps):
+        y_true_boot, y_prob_boot = resample(y_true, y_prob, random_state=i)
+        if len(np.unique(y_true_boot)) < 2: continue
+        stats.append(roc_auc_score(y_true_boot, y_prob_boot))
+    
+    if not stats: return 0.0, 0.0
+    lower = np.percentile(stats, ((1.0 - alpha) / 2.0) * 100)
+    upper = np.percentile(stats, (alpha + (1.0 - alpha) / 2.0) * 100)
+    return lower, upper
 
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    confusion_matrix,
-    f1_score,
-    accuracy_score,
-    roc_curve,
-    roc_auc_score,
-    auc
-)
+from sklearn.metrics import roc_curve, auc
 
-y_pred_proba = clf.predict_proba(X_test)[:, 1]
-y_pred = (y_pred_proba > 0.5).astype(int)
+def plot_mean_roc_with_std(tprs, aucs, model_name, ax=None, color='blue'):
+    """
+    여러 Fold의 ROC Curve 결과를 받아 평균 곡선과 표준편차 영역을 그리는 함수
+    
+    Args:
+        tprs (list): 각 Fold의 보간된 TPR 리스트 (np.interp로 생성)
+        aucs (list): 각 Fold의 AUROC 점수 리스트
+        model_name (str): 범례에 표시할 모델 이름
+        ax (matplotlib.axes): 그림을 그릴 축 (없으면 새로 생성)
+        color (str): 그래프 색상
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # 1. 기준 FPR 축 생성 (0부터 1까지 100개 구간)
+    mean_fpr = np.linspace(0, 1, 100)
+    
+    # 2. 평균 TPR과 표준편차 계산
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0 # 그래프 끝점을 (1,1)로 고정
+    std_tpr = np.std(tprs, axis=0)
+    
+    # 3. 평균 AUROC와 표준편차 계산
+    mean_auc = np.mean(aucs)
+    std_auc = np.std(aucs)
+    
+    # 4. 평균 ROC 곡선 그리기
+    ax.plot(mean_fpr, mean_tpr, color=color,
+            label=f'{model_name} (AUC = {mean_auc:.3f} $\pm$ {std_auc:.3f})',
+            lw=2, alpha=.8)
+    
+    # 5. 표준편차 영역(음영) 그리기 (Mean ± 1 Std)
+    tprs_upper = np.minimum(mean_tpr + std_tpr, 1) # 1.0을 넘지 않도록
+    tprs_lower = np.maximum(mean_tpr - std_tpr, 0) # 0.0보다 작지 않도록
+    ax.fill_between(mean_fpr, tprs_lower, tprs_upper, color=color, alpha=0.2,
+                    label=r'$\pm$ std. dev.')
+    
+    # 6. 랜덤 추측선 (대각선)
+    ax.plot([0, 1], [0, 1], linestyle='--', lw=2, color='black', alpha=.6)
+    
+    # 7. 그래프 꾸미기
+    ax.set_xlim([-0.05, 1.05])
+    ax.set_ylim([-0.05, 1.05])
+    ax.set_xlabel('False Positive Rate', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontsize=12)
+    ax.set_title('Receiver Operating Characteristic', fontsize=14)
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.3)
+    
+    return ax
 
-cm = confusion_matrix(y_test, y_pred)
-TN, FP, FN, TP = cm.ravel()
+tprs = []
+aucs = []
+mean_fpr = np.linspace(0, 1, 100)
 
-# Sensitivity (Recall)와 Specificity 계산
-sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
-specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+# --- 3. K-Fold CV 설정 ---
 
-# F1 Score, Accuracy, AUROC
-f1 = f1_score(y_test, y_pred)
-accuracy = accuracy_score(y_test, y_pred)
-auroc = roc_auc_score(y_test, y_pred_proba)
+K = 5
 
-# ROC curve
-fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
-roc_auc = auc(fpr, tpr)
+skf = StratifiedKFold(n_splits=K, shuffle=True, random_state=42)
 
-# AUROC의 95% CI using bootstraps
-n_bootstraps = 1000
-rng = np.random.RandomState(42)
-bootstrapped_scores = []
-for i in range(n_bootstraps):
-    indices = rng.randint(0, len(y_test), len(y_test))
-    if len(np.unique(y_test[indices])) < 2:
-        continue
-    score = roc_auc_score(y_test[indices], y_pred_proba[indices])
-    bootstrapped_scores.append(score)
 
-bootstrapped_scores = np.array(bootstrapped_scores)
-bootstrapped_scores.sort()
-ci_lower = bootstrapped_scores[int(0.025 * len(bootstrapped_scores))]
-ci_upper = bootstrapped_scores[int(0.975 * len(bootstrapped_scores))]
 
-print("Sensitivity (Recall): {:.4f}".format(sensitivity))
-print("Specificity: {:.4f}".format(specificity))
-print("F1 Score: {:.4f}".format(f1))
-print("Accuracy: {:.4f}".format(accuracy))
-print("AUROC: {:.4f}".format(auroc))
-print("95% CI for AUROC: [{:.4f}, {:.4f}]".format(ci_lower, ci_upper))
+# --- 4. 모델별 K-Fold CV 실행 루프 ---
 
-plt.figure(figsize=(8, 6))
-plt.plot(fpr, tpr, color='blue', label=f'ROC curve (AUC = {roc_auc:.2f})')
-plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('ROC Curve for Decision Tree')
-plt.legend(loc="lower right")
-plt.show()
+for model_name, current_features in model_feature_sets.items():
+
+    
+
+    print("\n" + "=" * 60)
+
+    print(f"🚀 [Testing] {model_name}")
+
+    print(f"   > Features ({len(current_features)}): {', '.join(current_features)}")
+
+    print("=" * 60)
+
+
+
+    # 현재 모델의 X 데이터 정의
+
+    X = df[current_features].values
+
+
+
+    # 각 폴드의 성능 지표를 저장할 리스트
+
+    fold_accuracy = []
+
+    fold_auroc = []
+
+    fold_sensitivity = []
+
+    fold_specificity = []
+    
+    fold_auroc_ci = []
+
+    fold_f1 = []
+
+
+
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, y)):
+
+        
+
+        # 1. K-Fold 데이터 분할
+
+        X_train, X_test = X[train_idx], X[test_idx]
+
+        y_train, y_test = y[train_idx], y[test_idx]
+
+
+
+        # 2. (중요!) SMOTE: 훈련 폴드(X_train)에만 적용
+
+        # (훈련 데이터가 비어있지 않고, 클래스가 2개 이상일 때만 SMOTE)
+
+        if len(X_train) > 0 and len(np.unique(y_train)) > 1:
+
+            smote = SMOTE(random_state=42)
+
+            X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+        else:
+
+            X_train_res, y_train_res = X_train, y_train
+
+
+
+        # 3. 모델 훈련 (max_depth=3는 논문과 동일하게 고정)
+
+        clf = DecisionTreeClassifier(max_depth=3, random_state=42)
+
+        clf.fit(X_train_res, y_train_res)
+
+
+
+        # 4. 테스트 폴드로 평가
+
+        y_pred_proba = clf.predict_proba(X_test)[:, 1]
+
+        y_pred = (y_pred_proba > 0.5).astype(int)
+
+
+
+        # 5. 성능 지표 계산
+
+        cm = confusion_matrix(y_test, y_pred)
+
+        TN, FP, FN, TP = cm.ravel()
+
+
+
+        sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
+
+        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+        f1 = f1_score(y_test, y_pred)
+
+        accuracy = accuracy_score(y_test, y_pred)
+
+        
+
+        # (테스트 폴드에 클래스가 하나만 있어도 AUROC 계산이 안됨)
+
+        # AUROC 및 CI 계산
+        if len(np.unique(y_test)) > 1:
+            auroc = roc_auc_score(y_test, y_pred_proba)
+            ci_low, ci_high = calculate_ci(y_test, y_pred_proba)
+            
+            # [시각화용] ROC Curve 데이터 수집
+            fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+            interp_tpr = np.interp(mean_fpr, fpr, tpr)
+            interp_tpr[0] = 0.0
+            tprs.append(interp_tpr)
+
+        else:
+
+            auroc = np.nan # 계산 불가능시 NaN 처리
+
+
+
+        # 6. 지표 저장
+
+        fold_accuracy.append(accuracy)
+
+        fold_auroc.append(auroc)
+
+        fold_sensitivity.append(sensitivity)
+
+        fold_specificity.append(specificity)
+
+
+        fold_f1.append(f1)
+
+        print(f"  > Fold {fold_idx + 1}/{K}... AUROC: {auroc:.4f} (95% CI: {ci_low:.3f}-{ci_high:.3f}), Accuracy: {accuracy:.4f}")
+
+
+
+    # --- 5. 모델별 최종 결과 보고 (Mean ± Std) ---
+
+    print("-" * 60)
+
+    print(f"📊 [Result] {model_name} (K-Fold CV)")
+
+    # np.nanmean/np.nanstd는 NaN 값을 무시하고 계산
+
+    print(f"AUROC:     {np.nanmean(fold_auroc):.4f} ± {np.nanstd(fold_auroc):.4f}")
+
+    print(f"Accuracy:  {np.mean(fold_accuracy):.4f} ± {np.std(fold_accuracy):.4f}")
+
+    print(f"Sensitivity: {np.mean(fold_sensitivity):.4f} ± {np.std(fold_sensitivity):.4f}")
+
+    print(f"Specificity: {np.mean(fold_specificity):.4f} ± {np.std(fold_specificity):.4f}")
+
+    print(f"F1 Score:    {np.mean(fold_f1):.4f} ± {np.std(fold_f1):.4f}")
+
+    print("=" * 60)
+
+    # --- 6. 그래프 그리기 (Mean ROC with Std) ---
+    # 유효한 AUROC 값만 필터링 (NaN 제거)
+    valid_aucs = [auc for auc in fold_auroc if not np.isnan(auc)]
+    
+    if len(tprs) > 0:
+        plt.figure(figsize=(8, 6))
+        plot_mean_roc_with_std(tprs, valid_aucs, model_name, color='blue')
+        plt.show()
+    else:
+        print("ROC Curve를 그릴 수 있는 데이터가 충분하지 않습니다.")
