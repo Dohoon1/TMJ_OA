@@ -36,7 +36,7 @@ set_seed(42)
 
 # --- 1. 데이터 로딩 ---
 
-xlsx_path = '/content/TMJ_OA_MRI_data (1).xlsx'
+xlsx_path = '/content/TMJ_OA_MRI_data.xlsx'
 
 df = pd.read_excel(xlsx_path).dropna()
 
